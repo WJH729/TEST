@@ -6,5 +6,5 @@ from grabber.ytdlp_wrapper import (
     get_playlist_entries,
     list_formats,
 )
-from grabber.page_parser import extract_page_metadata, parse_page
+from grabber.page_parser import discover_from_url, extract_page_metadata, parse_page
 from grabber.downloader import run_async_download
