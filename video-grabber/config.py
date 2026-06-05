@@ -48,6 +48,16 @@ DEFAULT_CONFIG = {
     "concurrent": 3,
     "max_retries": 3,
     "continue_dl": True,
+
+    # browser scraper
+    "browser_headless": True,
+    "browser_timeout": 30,
+
+    # site crawler
+    "crawler_max_pages": 50,
+    "crawler_max_depth": 3,
+    "crawler_concurrency": 5,
+    "crawler_same_domain": True,
 }
 
 

@@ -19,6 +19,9 @@ from grabber.ytdlp_wrapper import (
     list_formats,
 )
 from grabber.page_parser import discover_from_url
+from grabber.browser_scraper import scrape_sync
+from grabber.feed_parser import parse_feed_url
+from grabber.site_crawler import crawl_site, parse_sitemap
 from utils.formatter import (
     extract_height,
     filter_formats_by_max_height,
@@ -91,6 +94,7 @@ def main_menu():
                 questionary.Choice(title="🎵  提取音频", value="audio"),
                 questionary.Choice(title="📋  播放列表下载", value="playlist"),
                 questionary.Choice(title="📦  批量下载 (URL列表文件)", value="batch"),
+                questionary.Choice(title="🔍  高级抓取", value="advanced"),
                 questionary.Choice(title="📜  下载历史", value="history"),
                 questionary.Choice(title="⚙️  设置", value="settings"),
                 questionary.Choice(title="❌  退出", value="quit"),
@@ -109,6 +113,8 @@ def main_menu():
             _handle_playlist(cfg)
         elif choice == "batch":
             _handle_batch(cfg)
+        elif choice == "advanced":
+            _handle_advanced(cfg)
         elif choice == "history":
             _show_history()
         elif choice == "settings":
@@ -616,6 +622,434 @@ def _handle_batch(cfg: dict):
     questionary.press_any_key_to_continue("按 Enter 返回...").ask()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Advanced scraping — browser / feed / crawler / sitemap
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_advanced(cfg: dict):
+    """Advanced scraping submenu."""
+    while True:
+        console.clear()
+        print(Panel.fit("[bold magenta]  高级抓取  [/bold magenta]", width=60))
+
+        choice = questionary.select(
+            "选择抓取方式:",
+            choices=[
+                questionary.Choice(title="🌐  浏览器抓取 (Playwright)", value="browser"),
+                questionary.Choice(title="📡  RSS/Atom 订阅源解析", value="feed"),
+                questionary.Choice(title="🕷️  网站爬虫 (递归发现)", value="crawl"),
+                questionary.Choice(title="🗺️  Sitemap 解析", value="sitemap"),
+                questionary.Separator(),
+                questionary.Choice(title="返回主菜单", value="back"),
+            ],
+            qmark="",
+        ).ask()
+
+        if choice == "back":
+            break
+        elif choice == "browser":
+            _handle_browser_scrape(cfg)
+        elif choice == "feed":
+            _handle_feed_parse(cfg)
+        elif choice == "crawl":
+            _handle_crawl_site(cfg)
+        elif choice == "sitemap":
+            _handle_sitemap(cfg)
+
+
+def _handle_browser_scrape(cfg: dict):
+    """Playwright-based browser scraping for JS-rendered pages."""
+    console.clear()
+    url = questionary.text(
+        "输入页面 URL (将使用无头浏览器渲染):",
+        validate=lambda t: True if t.strip() else "URL 不能为空",
+    ).ask()
+    if not url:
+        return
+
+    headless = questionary.confirm(
+        "使用无头模式?", default=cfg.get("browser_headless", True)
+    ).ask()
+
+    print(f"\n[cyan]  启动浏览器，正在渲染页面...[/cyan]")
+    print("[dim]  (首次运行需安装 Chromium: playwright install chromium)[/dim]")
+
+    result = scrape_sync(
+        url,
+        headless=headless,
+        timeout_ms=cfg.get("browser_timeout", 30) * 1000,
+        scroll_to_bottom=True,
+        proxy=cfg.get("proxy", ""),
+    )
+
+    if result.get("error"):
+        print(f"[red]  {result['error']}[/red]")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    title = result.get("page_title", "")
+    print(f"\n[yellow]  页面标题: {title}[/yellow]")
+
+    # merge all discovered URLs
+    all_videos = result.get("dom_videos", []) + result.get("dom_audio", [])
+    net_urls = result.get("network_videos", [])
+    for u in net_urls:
+        all_videos.append({"url": u, "type": "network", "ext": "", "label": "网络拦截"})
+
+    if not all_videos:
+        print("[red]  未发现视频资源[/red]")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    # show discovered
+    table = Table(title=f"浏览器发现 {len(all_videos)} 个资源")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("来源", style="cyan", width=16)
+    table.add_column("类型", style="green", width=10)
+    table.add_column("URL", style="dim", width=60)
+    for i, v in enumerate(all_videos):
+        table.add_row(str(i+1), v.get("label", ""), v.get("ext", ""), v["url"][:58])
+    print(table)
+
+    choices = [
+        questionary.Choice(
+            title=f"[{v.get('label', ''):12}] {v['url'][:50]}",
+            value=i,
+        )
+        for i, v in enumerate(all_videos)
+    ]
+    chosen = questionary.checkbox(
+        "选择要下载的资源 (空格勾选):",
+        choices=choices,
+        qmark="",
+    ).ask()
+    if not chosen:
+        return
+
+    output_dir = _pick_output_dir(cfg)
+    if not output_dir:
+        return
+
+    success = 0
+    for i in chosen:
+        v = all_videos[i]
+        vu = v["url"]
+        print(f"\n[cyan]  下载: {vu[:60]}[/cyan]")
+        if v.get("ext") == "m3u8" or "m3u8" in vu:
+            ok = _download_with_ytdlp(vu, output_dir, cfg, {"title": title})
+        else:
+            ok = _download_direct(vu, output_dir, title or vu, cfg)
+        if ok:
+            success += 1
+            add_record(vu, title, output_dir, "成功")
+        else:
+            add_record(vu, title, output_dir, "失败")
+
+    print(f"\n[green]  完成: {success}/{len(chosen)} 成功[/green]")
+    questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+
+
+def _handle_feed_parse(cfg: dict):
+    """Parse RSS/Atom feed for video enclosures."""
+    console.clear()
+    feed_url = questionary.text(
+        "输入 RSS/Atom 订阅源 URL:",
+        validate=lambda t: True if t.strip() else "URL 不能为空",
+    ).ask()
+    if not feed_url:
+        return
+
+    print(f"\n[cyan]  正在解析订阅源...[/cyan]")
+    feed = parse_feed_url(feed_url)
+    feed_title = feed.get("feed_title", "未知")
+    entries = feed.get("entries", [])
+
+    if not entries:
+        print("[red]  未解析到条目[/red]")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    print(f"\n[green]  {feed_title}[/green]")
+    print(f"[green]  共 {len(entries)} 个条目[/green]")
+
+    # show entries with video counts
+    table = Table(title="订阅源条目")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("标题", style="cyan", width=35)
+    table.add_column("视频数", style="green")
+    table.add_column("发布时间", style="dim", width=20)
+    for i, entry in enumerate(entries[:20]):
+        table.add_row(
+            str(i+1),
+            entry.get("title", "")[:33],
+            str(len(entry.get("videos", []))),
+            entry.get("published", "")[:18],
+        )
+    if len(entries) > 20:
+        print(f"[dim]  ... 还有 {len(entries) - 20} 条[/dim]")
+    print(table)
+
+    # collect all video URLs
+    all_videos = []
+    for entry in entries:
+        for v in entry.get("videos", []):
+            all_videos.append({**v, "entry_title": entry.get("title", "")})
+
+    if not all_videos:
+        print("[yellow]  条目中没有视频附件，但可以尝试访问原页面抓取[/yellow]")
+        pick = questionary.select(
+            "选择操作:",
+            choices=[
+                questionary.Choice(title="选择条目，尝试从原页面抓取", value="page"),
+                questionary.Choice(title="返回", value="back"),
+            ],
+        ).ask()
+        if pick == "page":
+            entry_choices = [
+                questionary.Choice(
+                    title=f"{e.get('title', '无标题')[:50]}  ({e.get('published', '')})",
+                    value=i,
+                )
+                for i, e in enumerate(entries[:20])
+            ]
+            selected = questionary.checkbox(
+                "选择条目 (将逐个抓取原页面):",
+                choices=entry_choices,
+                qmark="",
+            ).ask()
+            if selected:
+                output_dir = _pick_output_dir(cfg)
+                if output_dir:
+                    for i in selected:
+                        page_url = entries[i].get("url", "")
+                        if page_url:
+                            print(f"[cyan]  抓取: {page_url}[/cyan]")
+                            _handle_download_from_url(page_url, output_dir, cfg)
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    # show discovered videos
+    table2 = Table(title=f"发现 {len(all_videos)} 个视频")
+    table2.add_column("#", style="dim", width=4)
+    table2.add_column("来源条目", style="cyan", width=25)
+    table2.add_column("格式", style="green")
+    table2.add_column("URL", style="dim", width=50)
+    for i, v in enumerate(all_videos):
+        table2.add_row(str(i+1), v.get("entry_title", "")[:23], v.get("ext", ""), v["url"][:48])
+    print(table2)
+
+    v_choices = [
+        questionary.Choice(title=f"[{v.get('ext', '?'):5}] {v['url'][:55]}", value=i)
+        for i, v in enumerate(all_videos)
+    ]
+    chosen = questionary.checkbox("选择要下载的视频:", choices=v_choices, qmark="").ask()
+    if not chosen:
+        return
+
+    output_dir = _pick_output_dir(cfg)
+    if not output_dir:
+        return
+
+    success = 0
+    for i in chosen:
+        v = all_videos[i]
+        vu = v["url"]
+        print(f"[cyan]  下载: {vu[:60]}[/cyan]")
+        ok = _download_direct(vu, output_dir, v.get("entry_title", vu), cfg)
+        if ok:
+            success += 1
+            add_record(vu, feed_title, output_dir, "成功")
+        else:
+            add_record(vu, feed_title, output_dir, "失败")
+
+    print(f"\n[green]  完成: {success}/{len(chosen)} 成功[/green]")
+    questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+
+
+def _handle_crawl_site(cfg: dict):
+    """Recursive site crawler to find video pages."""
+    console.clear()
+    start_url = questionary.text(
+        "输入起始 URL (将递归爬取同域名下的页面):",
+        validate=lambda t: True if t.strip() else "URL 不能为空",
+    ).ask()
+    if not start_url:
+        return
+
+    max_pages = questionary.text(
+        "最大爬取页数:", default=str(cfg.get("crawler_max_pages", 50))
+    ).ask()
+    max_pages = int(max_pages) if max_pages and max_pages.isdigit() else 50
+
+    max_depth = questionary.text(
+        "最大深度:", default=str(cfg.get("crawler_max_depth", 3))
+    ).ask()
+    max_depth = int(max_depth) if max_depth and max_depth.isdigit() else 3
+
+    print(f"\n[cyan]  开始爬取 (最多 {max_pages} 页, 深度 {max_depth})...[/cyan]")
+    print("[dim]  这可能需要几分钟...[/dim]")
+
+    results = crawl_site(
+        start_url,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        concurrency=cfg.get("crawler_concurrency", 5),
+        proxy=cfg.get("proxy", ""),
+    )
+
+    if not results:
+        print("[red]  未发现包含视频的页面[/red]")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    print(f"\n[green]  发现 {len(results)} 个包含视频的页面:[/green]")
+
+    table = Table(title="爬取结果")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("标题", style="cyan", width=35)
+    table.add_column("视频数", style="green")
+    table.add_column("深度", style="dim")
+    table.add_column("URL", style="dim", width=45)
+    for i, r in enumerate(results[:30]):
+        table.add_row(str(i+1), r.title[:33], str(r.video_count), str(r.depth), r.url[:43])
+    if len(results) > 30:
+        print(f"[dim]  ... 还有 {len(results) - 30} 个页面[/dim]")
+    print(table)
+
+    pick = questionary.select(
+        "",
+        choices=[
+            questionary.Choice(title="选择页面，逐个下载其中的视频", value="select"),
+            questionary.Choice(title="下载所有发现的视频 (可能非常多)", value="all"),
+            questionary.Choice(title="返回", value="back"),
+        ],
+        qmark="",
+    ).ask()
+
+    if pick == "back":
+        return
+
+    output_dir = _pick_output_dir(cfg)
+    if not output_dir:
+        return
+
+    if pick == "all":
+        pages_to_dl = results
+    else:
+        p_choices = [
+            questionary.Choice(
+                title=f"{r.title[:40]} ({r.video_count}个视频)",
+                value=i,
+            )
+            for i, r in enumerate(results[:30])
+        ]
+        selected = questionary.checkbox(
+            "选择页面:", choices=p_choices, qmark=""
+        ).ask()
+        if not selected:
+            return
+        pages_to_dl = [results[i] for i in selected]
+
+    total_ok = 0
+    total_all = 0
+    for page in pages_to_dl:
+        for v in page.videos:
+            total_all += 1
+            vu = v["url"]
+            print(f"[cyan]  下载: {vu[:60]}[/cyan]")
+            ok = _download_direct(vu, output_dir, page.title or vu, cfg)
+            if ok:
+                total_ok += 1
+                add_record(vu, page.title, output_dir, "成功")
+            else:
+                add_record(vu, page.title, output_dir, "失败")
+
+    print(f"\n[green]  完成: {total_ok}/{total_all} 成功[/green]")
+    questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+
+
+def _handle_sitemap(cfg: dict):
+    """Parse sitemap.xml to discover video URLs."""
+    console.clear()
+    domain = questionary.text(
+        "输入网站域名或 URL:",
+        validate=lambda t: True if t.strip() else "不能为空",
+    ).ask()
+    if not domain:
+        return
+
+    print(f"\n[cyan]  正在解析 sitemap...[/cyan]")
+    urls = parse_sitemap(domain)
+
+    if not urls:
+        print("[red]  未从 sitemap 中解析到 URL[/red]")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    print(f"[green]  从 sitemap 中发现 {len(urls)} 个 URL[/green]")
+
+    pick = questionary.select(
+        f"共 {len(urls)} 个 URL，选择操作:",
+        choices=[
+            questionary.Choice(title=f"全部逐个分析，下载发现的视频", value="all"),
+            questionary.Choice(title=f"只显示 URL 列表", value="list"),
+            questionary.Choice(title="返回", value="back"),
+        ],
+        qmark="",
+    ).ask()
+
+    if pick == "back":
+        return
+    elif pick == "list":
+        for i, u in enumerate(urls[:50]):
+            print(f"  {i+1:>4}. {u}")
+        if len(urls) > 50:
+            print(f"  ... 还有 {len(urls) - 50} 个")
+        questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+        return
+
+    output_dir = _pick_output_dir(cfg)
+    if not output_dir:
+        return
+
+    # analyze each URL for video content
+    total_found = 0
+    total_downloaded = 0
+    progress = create_progress()
+    with progress:
+        task_id = progress.add_task("分析 sitemap URLs", total=min(len(urls), 100))
+        for i, u in enumerate(urls[:100]):
+            progress.update(task_id, description=f"分析 [{i+1}/{min(len(urls), 100)}]")
+            discovery = discover_from_url(u, timeout=10, follow_iframes=False)
+            videos = discovery.get("videos", [])
+            total_found += len(videos)
+            for v in videos:
+                ok = _download_direct(v["url"], output_dir,
+                                      discovery.get("page_title", v["url"]), cfg)
+                if ok:
+                    total_downloaded += 1
+            progress.advance(task_id)
+
+    print(f"\n[green]  完成: 分析了 {min(len(urls), 100)} 个 URL, "
+          f"发现 {total_found} 个视频, 下载 {total_downloaded} 个[/green]")
+    questionary.press_any_key_to_continue("按 Enter 返回...").ask()
+
+
+def _handle_download_from_url(url: str, output_dir: str, cfg: dict):
+    """Quick download: analyze a page and download its first video."""
+    discovery = discover_from_url(url, timeout=15, follow_iframes=True)
+    videos = discovery.get("videos", [])
+    if not videos:
+        print(f"  [dim]  未发现视频[/dim]")
+        return
+    for v in videos[:3]:
+        vu = v["url"]
+        ok = _download_direct(vu, output_dir,
+                              discovery.get("page_title", url), cfg)
+        if ok:
+            add_record(vu, discovery.get("page_title", ""), output_dir, "成功")
+
+
 def _show_history():
     console.clear()
     history = load_history()
@@ -684,6 +1118,10 @@ def _handle_settings(cfg: dict):
             f"  最大重试:      {cfg['max_retries']}",
             f"  断点续传:      {'是' if cfg['continue_dl'] else '否'}",
             f"  ffmpeg:        {ffmpeg_status}",
+            f"  ── 爬虫设置 ──",
+            f"  浏览器无头:    {'是' if cfg.get('browser_headless', True) else '否'}",
+            f"  爬虫最大页数:  {cfg.get('crawler_max_pages', 50)}",
+            f"  爬虫最大深度:  {cfg.get('crawler_max_depth', 3)}",
         ]
         print("\n".join(lines))
         print()
@@ -703,6 +1141,10 @@ def _handle_settings(cfg: dict):
                 questionary.Choice(title="并发下载数", value="concurrent"),
                 questionary.Choice(title="最大重试次数", value="retries"),
                 questionary.Choice(title="断点续传", value="continue"),
+                questionary.Separator(),
+                questionary.Choice(title="浏览器无头模式", value="browser_headless"),
+                questionary.Choice(title="爬虫最大页数", value="crawler_max_pages"),
+                questionary.Choice(title="爬虫最大深度", value="crawler_max_depth"),
                 questionary.Separator(),
                 questionary.Choice(title="返回主菜单 (保存)", value="back"),
             ],
@@ -790,3 +1232,19 @@ def _handle_settings(cfg: dict):
             cfg["continue_dl"] = questionary.confirm(
                 "启用断点续传？", default=cfg.get("continue_dl", True)
             ).ask()
+        elif choice == "browser_headless":
+            cfg["browser_headless"] = questionary.confirm(
+                "浏览器使用无头模式？", default=cfg.get("browser_headless", True)
+            ).ask()
+        elif choice == "crawler_max_pages":
+            val = questionary.text(
+                "爬虫最大页数:", default=str(cfg.get("crawler_max_pages", 50))
+            ).ask()
+            if val and val.isdigit() and int(val) > 0:
+                cfg["crawler_max_pages"] = int(val)
+        elif choice == "crawler_max_depth":
+            val = questionary.text(
+                "爬虫最大深度:", default=str(cfg.get("crawler_max_depth", 3))
+            ).ask()
+            if val and val.isdigit() and int(val) > 0:
+                cfg["crawler_max_depth"] = int(val)
