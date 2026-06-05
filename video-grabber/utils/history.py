@@ -7,7 +7,10 @@ HISTORY_FILE = Path(__file__).parent.parent / "data" / "history.json"
 
 def load_history() -> list[dict]:
     if HISTORY_FILE.exists():
-        return json.loads(HISTORY_FILE.read_text("utf-8"))
+        try:
+            return json.loads(HISTORY_FILE.read_text("utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            return []
     return []
 
 
@@ -28,3 +31,14 @@ def add_record(url: str, title: str, filepath: str, status: str):
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
     save_history(history)
+
+
+def clear_history():
+    if HISTORY_FILE.exists():
+        HISTORY_FILE.write_text("[]", "utf-8")
+
+
+def export_history(filepath: str):
+    history = load_history()
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
