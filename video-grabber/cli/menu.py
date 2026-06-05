@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from config import load_config, save_config
+from config import QUALITY_PRESETS, load_config, save_config
 from grabber.ytdlp_wrapper import (
     download_playlist,
     download_url,
@@ -19,15 +19,60 @@ from grabber.ytdlp_wrapper import (
     list_formats,
 )
 from grabber.page_parser import discover_from_url
-from utils.formatter import format_size
+from utils.formatter import (
+    extract_height,
+    filter_formats_by_max_height,
+    format_size,
+    quality_to_max_height,
+    quality_to_ytdlp_format,
+    sort_formats_by_quality,
+)
 from utils.history import add_record, clear_history, load_history
 from cli.progress import ProgressHook, create_progress
 
 console = Console()
 
+# ordered quality keys shown in the picker (best → lowest)
+QUALITY_KEYS = list(QUALITY_PRESETS.keys())
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _pick_quality(cfg: dict) -> str:
+    """Ask user to select a quality preset. Returns the quality key."""
+    default_q = cfg.get("preferred_quality", "best")
+    if default_q not in QUALITY_PRESETS:
+        default_q = "best"
+
+    labels = [
+        questionary.Choice(
+            title=QUALITY_PRESETS[k]["label"],
+            value=k,
+        )
+        for k in QUALITY_KEYS
+    ]
+
+    return questionary.select(
+        "选择画质:",
+        choices=labels,
+        default=default_q,
+        qmark="",
+    ).ask() or "best"
+
+
+def _pick_output_dir(cfg: dict) -> str | None:
+    """Ask for output directory; returns None if user cancels."""
+    d = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
+    if d:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main menu
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main_menu():
-    """Main interactive loop."""
     cfg = load_config()
     Path(cfg["output_dir"]).mkdir(parents=True, exist_ok=True)
 
@@ -71,11 +116,11 @@ def main_menu():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Single download — the core flow
+#  Core download flow
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_download(cfg: dict, audio_only: bool = False):
-    """Core download flow with yt-dlp + enhanced page parser fallback."""
+    """Core download: yt-dlp first, then page-parser fallback."""
     console.clear()
     url = questionary.text(
         "输入视频页面 URL:" if not audio_only else "输入音频/视频页面 URL (仅提取音频):",
@@ -87,20 +132,19 @@ def _handle_download(cfg: dict, audio_only: bool = False):
     mode_label = "音频" if audio_only else "视频"
     print(f"\n[cyan]  正在分析 ({mode_label}模式)...[/cyan]")
 
-    # ── Phase 1: try yt-dlp ──
+    # ── Phase 1: yt-dlp ──
     print("[dim]  尝试 yt-dlp 解析...[/dim]")
     meta = get_metadata(url, proxy=cfg.get("proxy", ""))
     formats = list_formats(url, proxy=cfg.get("proxy", ""))
-
     ytdlp_worked = bool(formats)
 
-    # ── Phase 2: always run page parser as supplementary ──
+    # ── Phase 2: page-parser (supplementary / fallback) ──
     if not ytdlp_worked:
         print("[dim]  yt-dlp 无结果，启动智能页面扫描...[/dim]")
     discovery = discover_from_url(url, timeout=15, follow_iframes=True)
     discovered = discovery.get("videos", [])
 
-    # merge metadata
+    # merge metadata when yt-dlp returned nothing
     if not meta or not meta.get("title"):
         if discovery.get("page_title"):
             meta = meta or {}
@@ -113,18 +157,17 @@ def _handle_download(cfg: dict, audio_only: bool = False):
     if meta and meta.get("title"):
         _show_meta_info(meta)
 
-    # ── Phase 3: if yt-dlp found formats, use them (best quality) ──
+    # ── Phase 3: route ──
     if ytdlp_worked:
         _download_via_ytdlp(url, formats, meta, cfg, audio_only,
                             discovered_count=len(discovered))
         return
 
-    # ── Phase 4: use page-parser discoveries ──
     if not discovered:
         print("[red]  未能检测到任何视频资源[/red]")
-        print("[dim]  提示: 可以尝试以下方法:[/dim]")
+        print("[dim]  提示:[/dim]")
         print("[dim]    1. 确认 URL 是否正确[/dim]")
-        print("[dim]    2. 在浏览器中打开页面 → F12 → Network → 搜索 .mp4 / .m3u8[/dim]")
+        print("[dim]    2. 浏览器 F12 → Network → 搜索 .mp4 / .m3u8[/dim]")
         print("[dim]    3. 复制直接视频链接后重试[/dim]")
         questionary.press_any_key_to_continue("按 Enter 返回...").ask()
         return
@@ -134,58 +177,94 @@ def _handle_download(cfg: dict, audio_only: bool = False):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Download handlers
+#  yt-dlp path — quality selection → format pick → download
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _download_via_ytdlp(url, formats, meta, cfg, audio_only, discovered_count=0):
-    """Standard yt-dlp download with format selection."""
+    """yt-dlp download with quality-picker and optional format refinement."""
+
+    # optional: show page-parser discoveries
     if discovered_count:
         print(f"[dim]  页面解析器另外发现 {discovered_count} 个潜在视频源[/dim]")
-        show_extra = questionary.confirm("是否查看页面解析器发现的额外视频源?", default=False).ask()
+        show_extra = questionary.confirm(
+            "是否查看页面解析器发现的额外视频源?", default=False
+        ).ask()
         if show_extra:
             discovery = discover_from_url(url, timeout=15, follow_iframes=True)
-            discovered = discovery.get("videos", [])
-            if discovered:
-                _show_discovered_table(discovery, discovered)
-                use_discovered = questionary.confirm("使用页面发现的视频源?", default=False).ask()
-                if use_discovered:
-                    _download_discovered(discovered, meta, cfg, audio_only)
+            disc = discovery.get("videos", [])
+            if disc:
+                _show_discovered_table(discovery, disc)
+                if questionary.confirm("使用页面发现的视频源?", default=False).ask():
+                    _download_discovered(disc, meta, cfg, audio_only)
                     return
 
-    _show_format_table(formats, audio_only)
+    # ── quality picker ──
+    quality_key = _pick_quality(cfg)
+    max_height = quality_to_max_height(quality_key)
+
+    # filter & sort
+    filtered = filter_formats_by_max_height(formats, max_height)
+    filtered = sort_formats_by_quality(filtered)
+
+    if not filtered:
+        print(f"[yellow]  当前画质 {quality_key} 下无可选格式，显示全部[/yellow]")
+        filtered = sort_formats_by_quality(formats)
+
+    _show_format_table(filtered)
 
     if audio_only:
-        output_dir = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
+        output_dir = _pick_output_dir(cfg)
         if not output_dir:
             return
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
         _do_audio_download(url, output_dir, meta, cfg)
-    else:
-        choices = [
+        return
+
+    # format selection
+    choices = []
+    for i, f in enumerate(filtered):
+        height = extract_height(f.get("resolution")) or 0
+        note = f.get("note", "")
+        tag = ""
+        if height >= 2160:
+            tag = " [4K]"
+        elif height >= 1080:
+            tag = " [FHD]"
+        elif height >= 720:
+            tag = " [HD]"
+        choices.append(
             questionary.Choice(
-                title=f"{f['resolution']:>12}  {f['ext']:>5}  {format_size(f['filesize']):>10}  {f.get('note', ''):12}  [{f['format_id']}]",
+                title=f"{f['resolution']:>12}  {f['ext']:>5}  {format_size(f['filesize']):>10}  {note:12}{tag}  [{f['format_id']}]",
                 value=i,
             )
-            for i, f in enumerate(formats)
-        ]
-        choices.insert(0, questionary.Choice(title="最佳质量 (自动选择)", value=-1))
+        )
 
-        selected = questionary.select("选择要下载的视频格式:", choices=choices, qmark="").ask()
-        if selected is None:
-            return
+    # prepend auto-choice (best at selected quality)
+    auto_label = f"自动 — {QUALITY_PRESETS.get(quality_key, {}).get('label', quality_key)}"
+    choices.insert(0, questionary.Choice(title=auto_label, value=-1))
 
-        output_dir = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
-        if not output_dir:
-            return
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    selected = questionary.select(
+        "选择要下载的视频格式:",
+        choices=choices,
+        qmark="",
+    ).ask()
+    if selected is None:
+        return
 
-        if selected == -1:
-            format_spec = cfg.get("default_format", "bestvideo+bestaudio/best")
-        else:
-            format_spec = formats[selected]["format_id"]
+    output_dir = _pick_output_dir(cfg)
+    if not output_dir:
+        return
 
-        _do_video_download(url, output_dir, format_spec, meta, cfg)
+    if selected == -1:
+        format_spec = quality_to_ytdlp_format(quality_key)
+    else:
+        format_spec = filtered[selected]["format_id"]
 
+    _do_video_download(url, output_dir, format_spec, meta, cfg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Discovered-URL download path
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _download_discovered(discovered: list[dict], meta: dict, cfg: dict,
                          audio_only: bool = False):
@@ -208,10 +287,9 @@ def _download_discovered(discovered: list[dict], meta: dict, cfg: dict,
         if not chosen:
             return
 
-    output_dir = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
+    output_dir = _pick_output_dir(cfg)
     if not output_dir:
         return
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     title = meta.get("title", "")
     success_count = 0
@@ -222,18 +300,11 @@ def _download_discovered(discovered: list[dict], meta: dict, cfg: dict,
         print(f"\n[cyan]  下载 [{i+1}/{len(chosen)}]: {vid_url[:60]}[/cyan]")
         print(f"  来源: {v['label']}")
 
-        # Choose strategy based on URL type
-        if vid_type == "iframe_embed":
-            # pass to yt-dlp
-            ok = _download_with_ytdlp(vid_url, output_dir, cfg, meta)
-        elif v.get("ext") == "m3u8" or "m3u8" in vid_url.lower():
-            # m3u8 streams need yt-dlp or ffmpeg
+        if vid_type == "iframe_embed" or v.get("ext") == "m3u8" or "m3u8" in vid_url.lower():
             ok = _download_with_ytdlp(vid_url, output_dir, cfg, meta)
         elif v.get("ext") in ("mp4", "mkv", "webm", "flv", "mov", "avi", "wmv"):
-            # direct download
             ok = _download_direct(vid_url, output_dir, title, cfg)
         else:
-            # unknown — try yt-dlp first, then direct
             ok = _download_with_ytdlp(vid_url, output_dir, cfg, meta)
             if not ok:
                 ok = _download_direct(vid_url, output_dir, title, cfg)
@@ -248,8 +319,15 @@ def _download_discovered(discovered: list[dict], meta: dict, cfg: dict,
     questionary.press_any_key_to_continue("按 Enter 返回主菜单...").ask()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Download executors
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _download_with_ytdlp(url: str, output_dir: str, cfg: dict, meta: dict) -> bool:
-    """Download using yt-dlp with progress bar."""
+    """Download using yt-dlp with quality preset + progress bar."""
+    quality_key = cfg.get("preferred_quality", "best")
+    format_spec = quality_to_ytdlp_format(quality_key)
+
     progress = create_progress()
     with progress:
         task_id = progress.add_task(
@@ -258,7 +336,7 @@ def _download_with_ytdlp(url: str, output_dir: str, cfg: dict, meta: dict) -> bo
         hook = ProgressHook(progress, task_id)
         return download_url(
             url, output_dir,
-            format_spec=cfg.get("default_format", "bestvideo+bestaudio/best"),
+            format_spec=format_spec,
             proxy=cfg.get("proxy", ""),
             cookie_file=cfg.get("cookie_file", ""),
             merge_format=cfg.get("merge_format", "mp4"),
@@ -270,7 +348,7 @@ def _download_with_ytdlp(url: str, output_dir: str, cfg: dict, meta: dict) -> bo
 
 
 def _download_direct(url: str, output_dir: str, title: str, cfg: dict) -> bool:
-    """Download a direct video URL (mp4, etc.) with requests + progress."""
+    """Direct HTTP download with progress bar."""
     import requests as req
     from utils.formatter import safe_filename
 
@@ -285,7 +363,10 @@ def _download_direct(url: str, output_dir: str, title: str, cfg: dict) -> bool:
             resp = req.get(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36"
+                    ),
                     "Referer": url,
                 },
                 stream=True,
@@ -293,7 +374,9 @@ def _download_direct(url: str, output_dir: str, title: str, cfg: dict) -> bool:
             )
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", 0))
-            task_id = progress.add_task(f"下载: {filename[:40]}", total=total or None)
+            task_id = progress.add_task(
+                f"下载: {filename[:40]}", total=total or None
+            )
             downloaded = 0
             Path(dest).parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
@@ -311,7 +394,7 @@ def _download_direct(url: str, output_dir: str, title: str, cfg: dict) -> bool:
 
 
 def _do_video_download(url, output_dir, format_spec, meta, cfg):
-    """Execute a yt-dlp video download with progress bar."""
+    """Execute yt-dlp video download with progress."""
     progress = create_progress()
     with progress:
         task_id = progress.add_task(
@@ -370,7 +453,6 @@ def _do_audio_download(url, output_dir, meta, cfg):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _show_meta_info(meta: dict):
-    """Display video metadata nicely."""
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="cyan", width=10)
     table.add_column(style="white")
@@ -385,9 +467,8 @@ def _show_meta_info(meta: dict):
     print(table)
 
 
-def _show_format_table(formats: list[dict], audio_only: bool = False):
-    """Display available formats in a rich table."""
-    table = Table(title="可用格式")
+def _show_format_table(formats: list[dict]):
+    table = Table(title=f"可用格式 ({len(formats)} 个)")
     table.add_column("#", style="dim", width=4)
     table.add_column("分辨率", style="cyan")
     table.add_column("扩展名", style="green")
@@ -397,54 +478,44 @@ def _show_format_table(formats: list[dict], audio_only: bool = False):
     for i, f in enumerate(formats):
         vcodec = f.get("vcodec", "?")
         acodec = f.get("acodec", "?")
-        codec_info = ""
+        codec = ""
         if vcodec and vcodec != "none":
-            codec_info += vcodec[:8]
+            codec += vcodec[:6]
         if acodec and acodec != "none":
-            if codec_info:
-                codec_info += "+"
-            codec_info += acodec[:8]
+            if codec:
+                codec += "+"
+            codec += acodec[:6]
         table.add_row(
             str(i + 1),
             f.get("resolution", "?"),
             f.get("ext", "?"),
             format_size(f.get("filesize")),
-            codec_info or "?",
+            codec or "?",
             f.get("note", ""),
         )
     print(table)
 
 
 def _show_discovered_table(discovery: dict, videos: list[dict]):
-    """Display page-parser discoveries in a table."""
-    title = discovery.get("page_title", "未知")
-    print(f"\n[yellow]  页面标题: {title}[/yellow]")
-
+    print(f"\n[yellow]  页面标题: {discovery.get('page_title', '未知')}[/yellow]")
     table = Table(title=f"从页面中发现 {len(videos)} 个视频源")
     table.add_column("#", style="dim", width=4)
     table.add_column("来源类型", style="cyan", width=16)
     table.add_column("标签", style="green", width=20)
     table.add_column("URL", style="dim", width=60)
-
     for i, v in enumerate(videos):
-        table.add_row(
-            str(i + 1),
-            v.get("type", "?"),
-            v.get("label", ""),
-            v["url"][:58],
-        )
-
+        table.add_row(str(i + 1), v.get("type", "?"), v.get("label", ""), v["url"][:58])
     print(table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Other menu handlers (playlist, batch, history, settings)
+#  Playlist / Batch / History / Settings
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_playlist(cfg: dict):
-    """Playlist download flow."""
     console.clear()
-    url = questionary.text("输入播放列表 URL:", validate=lambda t: True if t.strip() else "不能为空").ask()
+    url = questionary.text("输入播放列表 URL:",
+                           validate=lambda t: True if t.strip() else "不能为空").ask()
     if not url:
         return
 
@@ -461,16 +532,19 @@ def _handle_playlist(cfg: dict):
     if len(entries) > 10:
         print(f"  ... 还有 {len(entries) - 10} 个")
 
-    confirm = questionary.confirm(
-        f"\n确定下载全部 {len(entries)} 个视频？", default=False,
-    ).ask()
-    if not confirm:
+    if not questionary.confirm(
+        f"\n确定下载全部 {len(entries)} 个视频？", default=False
+    ).ask():
         return
 
-    output_dir = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
+    # quality picker
+    quality_key = _pick_quality(cfg)
+    format_spec = quality_to_ytdlp_format(quality_key)
+    print(f"[dim]  画质: {QUALITY_PRESETS[quality_key]['label']}[/dim]")
+
+    output_dir = _pick_output_dir(cfg)
     if not output_dir:
         return
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     print(f"\n[cyan]  开始下载播放列表...[/cyan]")
     progress = create_progress()
@@ -478,8 +552,7 @@ def _handle_playlist(cfg: dict):
         task_id = progress.add_task("播放列表下载", total=len(entries))
         hook = ProgressHook(progress, task_id)
         success, total = download_playlist(
-            url, output_dir,
-            format_spec=cfg.get("default_format", "bestvideo+bestaudio/best"),
+            url, output_dir, format_spec=format_spec,
             proxy=cfg.get("proxy", ""),
             cookie_file=cfg.get("cookie_file", ""),
             merge_format=cfg.get("merge_format", "mp4"),
@@ -496,7 +569,6 @@ def _handle_playlist(cfg: dict):
 
 
 def _handle_batch(cfg: dict):
-    """Batch download from a file."""
     console.clear()
     file_path = questionary.path("输入 URL 列表文件路径:").ask()
     if not file_path or not os.path.exists(file_path):
@@ -505,13 +577,19 @@ def _handle_batch(cfg: dict):
         return
 
     with open(file_path, encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        urls = [line.strip() for line in f
+                if line.strip() and not line.startswith("#")]
 
     print(f"[cyan]  共发现 {len(urls)} 个链接[/cyan]")
-    output_dir = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
+
+    # quality picker
+    quality_key = _pick_quality(cfg)
+    format_spec = quality_to_ytdlp_format(quality_key)
+    print(f"[dim]  画质: {QUALITY_PRESETS[quality_key]['label']}[/dim]")
+
+    output_dir = _pick_output_dir(cfg)
     if not output_dir:
         return
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     success = 0
     progress = create_progress()
@@ -520,8 +598,7 @@ def _handle_batch(cfg: dict):
         for i, url in enumerate(urls):
             progress.update(task_id, description=f"批量下载 [{i+1}/{len(urls)}]")
             ok = download_url(
-                url, output_dir,
-                format_spec=cfg.get("default_format", "bestvideo+bestaudio/best"),
+                url, output_dir, format_spec=format_spec,
                 proxy=cfg.get("proxy", ""),
                 cookie_file=cfg.get("cookie_file", ""),
                 merge_format=cfg.get("merge_format", "mp4"),
@@ -540,7 +617,6 @@ def _handle_batch(cfg: dict):
 
 
 def _show_history():
-    """Display download history with management options."""
     console.clear()
     history = load_history()
     if not history:
@@ -585,18 +661,20 @@ def _show_history():
 
 
 def _handle_settings(cfg: dict):
-    """Settings menu."""
     ffmpeg_status = "[green]✓ 已检测[/green]" if cfg.get("ffmpeg_path") else "[red]✗ 未安装[/red]"
+    cur_q = cfg.get("preferred_quality", "best")
+    q_label = QUALITY_PRESETS.get(cur_q, {}).get("label", cur_q)
 
     while True:
         console.clear()
         print(Panel.fit("[bold]  设置  [/bold]", width=60))
 
-        current = [
+        lines = [
             f"  输出目录:      {cfg['output_dir']}",
+            f"  默认画质:      {q_label}",
+            f"  最大文件大小:  {cfg.get('max_filesize_mb', 0) or '不限制'} MB",
             f"  代理:          {cfg['proxy'] or '无'}",
             f"  Cookie 文件:   {cfg['cookie_file'] or '无'}",
-            f"  默认格式:      {cfg['default_format']}",
             f"  合并格式:      {cfg['merge_format']}",
             f"  音频格式:      {cfg['audio_format']}",
             f"  字幕语言:      {cfg['subtitle_lang']}",
@@ -607,16 +685,17 @@ def _handle_settings(cfg: dict):
             f"  断点续传:      {'是' if cfg['continue_dl'] else '否'}",
             f"  ffmpeg:        {ffmpeg_status}",
         ]
-        print("\n".join(current))
+        print("\n".join(lines))
         print()
 
         choice = questionary.select(
             "选择要修改的配置:",
             choices=[
                 questionary.Choice(title="输出目录", value="output_dir"),
+                questionary.Choice(title="默认画质", value="quality"),
+                questionary.Choice(title="最大文件大小", value="max_size"),
                 questionary.Choice(title="代理地址", value="proxy"),
                 questionary.Choice(title="Cookie 文件路径", value="cookie"),
-                questionary.Choice(title="默认下载格式", value="format"),
                 questionary.Choice(title="合并输出格式", value="merge_format"),
                 questionary.Choice(title="音频提取格式", value="audio_format"),
                 questionary.Choice(title="字幕语言", value="subtitle"),
@@ -637,22 +716,36 @@ def _handle_settings(cfg: dict):
             val = questionary.text("输出目录:", default=cfg["output_dir"]).ask()
             if val:
                 cfg["output_dir"] = val
-        elif choice == "proxy":
-            val = questionary.text("代理地址 (如 socks5://127.0.0.1:1080，留空清除):",
-                                   default=cfg.get("proxy", "")).ask()
-            cfg["proxy"] = val.strip() if val else ""
-        elif choice == "cookie":
-            val = questionary.text("Cookie 文件路径 (Netscape 格式，留空清除):",
-                                   default=cfg.get("cookie_file", "")).ask()
-            cfg["cookie_file"] = val.strip() if val else ""
-        elif choice == "format":
-            val = questionary.text(
-                "默认格式:",
-                default=cfg.get("default_format", "bestvideo+bestaudio/best"),
-                instruction="(bestvideo+bestaudio/best, best, worst, 或指定格式ID)",
+        elif choice == "quality":
+            val = questionary.select(
+                "默认画质:",
+                choices=[questionary.Choice(title=v["label"], value=k)
+                         for k, v in QUALITY_PRESETS.items()],
+                default=cur_q,
             ).ask()
             if val:
-                cfg["default_format"] = val
+                cfg["preferred_quality"] = val
+                cur_q = val
+                q_label = QUALITY_PRESETS[val]["label"]
+        elif choice == "max_size":
+            val = questionary.text(
+                "最大文件大小 (MB, 0=不限制):",
+                default=str(cfg.get("max_filesize_mb", 0)),
+            ).ask()
+            if val and val.isdigit():
+                cfg["max_filesize_mb"] = int(val)
+        elif choice == "proxy":
+            val = questionary.text(
+                "代理地址 (如 socks5://127.0.0.1:1080，留空清除):",
+                default=cfg.get("proxy", ""),
+            ).ask()
+            cfg["proxy"] = val.strip() if val else ""
+        elif choice == "cookie":
+            val = questionary.text(
+                "Cookie 文件路径 (Netscape 格式，留空清除):",
+                default=cfg.get("cookie_file", ""),
+            ).ask()
+            cfg["cookie_file"] = val.strip() if val else ""
         elif choice == "merge_format":
             val = questionary.select(
                 "合并输出格式:",
@@ -670,23 +763,30 @@ def _handle_settings(cfg: dict):
             if val:
                 cfg["audio_format"] = val
         elif choice == "subtitle":
-            val = questionary.text("字幕语言 (逗号分隔，如 zh,en):",
-                                   default=cfg.get("subtitle_lang", "zh,en")).ask()
+            val = questionary.text(
+                "字幕语言 (逗号分隔，如 zh,en):",
+                default=cfg.get("subtitle_lang", "zh,en"),
+            ).ask()
             if val is not None:
                 cfg["subtitle_lang"] = val
         elif choice == "thumbnail":
-            val = questionary.confirm("下载后嵌入缩略图？",
-                                      default=cfg.get("embed_thumbnail", True)).ask()
-            cfg["embed_thumbnail"] = val
+            cfg["embed_thumbnail"] = questionary.confirm(
+                "下载后嵌入缩略图？",
+                default=cfg.get("embed_thumbnail", True),
+            ).ask()
         elif choice == "concurrent":
-            val = questionary.text("并发下载数:", default=str(cfg.get("concurrent", 3))).ask()
+            val = questionary.text(
+                "并发下载数:", default=str(cfg.get("concurrent", 3))
+            ).ask()
             if val and val.isdigit() and 1 <= int(val) <= 10:
                 cfg["concurrent"] = int(val)
         elif choice == "retries":
-            val = questionary.text("最大重试次数:", default=str(cfg.get("max_retries", 3))).ask()
+            val = questionary.text(
+                "最大重试次数:", default=str(cfg.get("max_retries", 3))
+            ).ask()
             if val and val.isdigit():
                 cfg["max_retries"] = int(val)
         elif choice == "continue":
-            val = questionary.confirm("启用断点续传？",
-                                      default=cfg.get("continue_dl", True)).ask()
-            cfg["continue_dl"] = val
+            cfg["continue_dl"] = questionary.confirm(
+                "启用断点续传？", default=cfg.get("continue_dl", True)
+            ).ask()
